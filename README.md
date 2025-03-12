@@ -1,8 +1,8 @@
-
+                                                                            GMD Tool Converter
 This is a code of an app that allows to convert .gmd scripts into more human-readable format and to edit (AKA translate) in a more comfortable way. All the changes are immediately
 transferred to the original script text.
 
-                                                                                    Instructions:
+                                                                            Instructions:
 After executing the code you should copypaste the script text into the first tab, then hit the "Показать текст на второй вкладке" button. Alternitavely, you can download the 
 script text by clicking the "Загрузить файл" button.
 After that hit any text panel you want to translate and make changes to it. After making satisfiable changes tap the check button. The changes are immediately saved in the
