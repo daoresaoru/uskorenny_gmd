@@ -7,8 +7,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QFrame, QSizePolicy, QMessageBox, QProgressBar, QComboBox,
     QSplitter
 )
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QPalette, QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtGui import QColor, QPalette, QFont, QTextCharFormat, QSyntaxHighlighter
 
 
 # ─────────────────────────────────────────────
@@ -65,8 +65,39 @@ STATUS_LABELS = {
 
 MAX_LINE_LEN = 55
 
-_TAG_RE  = re.compile(r'(<[^>]+>)')   # splits AND captures tags
+_TAG_RE  = re.compile(r'(<[^>]+>)')
 _E003_RE = re.compile(r'^<E003')
+
+# Color tags: open → CSS color, E005 = close
+COLOR_TAGS: dict[str, str] = {
+    '<E006>': '#ff6b6b',   # red
+    '<E007>': '#6b9fff',   # blue
+    '<E008>': '#6bff8a',   # green
+    '<E009>': '#ffe06b',   # yellow
+}
+COLOR_CLOSE_TAG = '<E005>'
+
+# Tags shown as small badges in the original display
+BADGE_TAGS: dict[str, str] = {
+    '<E025':  'spd',
+    '<E085':  'wait',
+    '<E330':  'shake',
+    '<E331':  'shake',
+    '<E332':  'shake',
+    '<E333':  'shake',
+    '<E334':  'shake',
+    '<E338':  'anim',
+    '<E341':  'anim',
+    '<E346':  'anim',
+    '<E043':  'style',
+    '<E044':  'style',
+    '<E169':  'lip',
+    '<E145':  'expr',
+    '<E603':  'sfx',
+    '<E606':  'sfx',
+    '<E615':  'sfx',
+    '<E092':  'cam',
+}
 
 
 def extract_character(segment: str) -> str | None:
@@ -94,106 +125,194 @@ def line_length_warning(text: str) -> tuple[str, int]:
 
 
 # ─────────────────────────────────────────────
-#  Chunk parsing
-#
-#  Split a segment into "pause chunks" on <E003 X> boundaries.
-#  Each chunk:  { prefix_tags, text, pause_tag }
-#  prefix_tags = all tags that come before the first text character of this chunk
-#  text        = concatenated visible text (stripped)
-#  pause_tag   = the <E003 X> that closes this chunk (or "" for the last one)
+#  Chunk parsing — split on ANY tag boundary
 # ─────────────────────────────────────────────
 
 def parse_chunks(segment: str) -> list[dict]:
-    """Return list of chunk dicts."""
-    tokens = _TAG_RE.split(segment)   # alternates: text, tag, text, tag …
+    """
+    Split a segment into translatable chunks. A new chunk begins after every
+    tag that interrupts text flow. Each chunk stores:
+      prefix_tags  – all tags immediately before this chunk's text (for injection)
+      text         – plain stripped text
+      pause_tag    – the tag that ended this chunk (for display label)
+    """
+    tokens = _TAG_RE.split(segment)
 
     chunks: list[dict] = []
-    prefix_tags = ""
+    prefix_tags  = ""
     current_text = ""
 
-    def flush(pause_tag: str):
+    def flush(closing_tag: str):
         nonlocal prefix_tags, current_text
         text_clean = re.sub(r'\s+', ' ', current_text).strip()
-        chunks.append({
-            "prefix_tags": prefix_tags,
-            "text":        text_clean,
-            "pause_tag":   pause_tag,
-        })
-        prefix_tags = ""
+        if text_clean:
+            chunks.append({
+                "prefix_tags": prefix_tags,
+                "text":        text_clean,
+                "pause_tag":   closing_tag,
+            })
+        prefix_tags  = ""
         current_text = ""
 
     for token in tokens:
         if not token:
             continue
-        if _TAG_RE.match(token):                  # it's a tag
-            if _E003_RE.match(token):
+        if _TAG_RE.match(token):          # it's a tag
+            if current_text.strip():
+                # Text was accumulating — this tag ends the current chunk
                 flush(token)
+                # The tag that caused the split becomes the prefix of the next chunk
+                prefix_tags = token
             else:
-                if current_text.strip():
-                    # tag after text but before E003 — treat as part of text display
-                    pass
-                else:
-                    prefix_tags += token
-        else:                                     # it's text
+                # No text yet — accumulate into prefix
+                prefix_tags += token
+        else:                             # it's text
             current_text += token
 
-    # flush trailing chunk
-    text_clean = re.sub(r'\s+', ' ', current_text).strip()
-    if text_clean or prefix_tags:
-        chunks.append({"prefix_tags": prefix_tags, "text": text_clean, "pause_tag": ""})
-
-    # Remove chunks that are completely empty (no text and no meaningful prefix)
-    chunks = [c for c in chunks if c["text"]]
+    flush("")   # flush any remaining text
     return chunks
 
 
 def inject_translations(segment: str, translations: list[str]) -> str:
     """
-    Replace each visible text run in `segment` with the corresponding
-    translation string, keeping every tag in its original position.
-
-    Strategy:
-      - Tokenise on tags.
-      - Collect runs of non-empty text tokens into groups separated by <E003>.
-      - Replace the *first* text token of each group with the translation;
-        set subsequent tokens in the same group to "".
+    Replace each visible text run in segment with the corresponding translation,
+    keeping every tag in its exact original position.
+    Each non-empty text token run between tags maps to one translation entry.
     """
-    tokens = _TAG_RE.split(segment)   # [text, tag, text, tag …]
+    tokens = _TAG_RE.split(segment)
 
-    # Identify "real text" token indices and group them by E003 boundary
-    groups: list[list[int]] = []
-    current_group: list[int] = []
+    # Find indices of all non-empty text tokens in order
+    text_indices = [i for i, t in enumerate(tokens) if not _TAG_RE.match(t) and t.strip()]
 
-    for i, token in enumerate(tokens):
-        if _TAG_RE.match(token):        # tag
-            if _E003_RE.match(token) and current_group:
-                groups.append(current_group)
-                current_group = []
-        else:                           # text
-            if token.strip():
-                current_group.append(i)
-
-    if current_group:
-        groups.append(current_group)
-
-    # Build replacement map
     replacement: dict[int, str] = {}
-    for gi, group in enumerate(groups):
-        trans = translations[gi].strip() if gi < len(translations) else ""
-        if not trans:
-            continue   # keep original if translation empty
-        for ti, tok_idx in enumerate(group):
-            replacement[tok_idx] = trans if ti == 0 else ""
+    for ti, tok_idx in enumerate(text_indices):
+        trans = translations[ti].strip() if ti < len(translations) else ""
+        if trans:
+            replacement[tok_idx] = trans
 
-    # Rebuild
-    result_tokens = []
-    for i, token in enumerate(tokens):
-        if i in replacement:
-            result_tokens.append(replacement[i])
+    return "".join(replacement.get(i, t) for i, t in enumerate(tokens))
+
+
+# ─────────────────────────────────────────────
+#  Rich HTML rendering for original display
+# ─────────────────────────────────────────────
+
+def _tag_badge_html(tag: str) -> str:
+    for prefix, label in BADGE_TAGS.items():
+        if tag.startswith(prefix):
+            return (
+                f'<span style="background:#2a2a44;color:#8888cc;'
+                f'font-size:9px;border-radius:2px;padding:0 2px;">'
+                f'[{label}]</span>'
+            )
+    return ''
+
+
+def segment_to_rich_html(prefix_tags: str, text: str) -> str:
+    """
+    Render a chunk as HTML for the original display panel.
+    prefix_tags is scanned first to determine the color context entering 'text'
+    (e.g. if <E006> is the prefix, the text renders with a red background).
+    Badge tags render as small grey labels; everything else is invisible.
+    """
+    # Determine color context from prefix_tags
+    active_color: str | None = None
+    for tag in _TAG_RE.findall(prefix_tags):
+        if tag in COLOR_TAGS:
+            active_color = COLOR_TAGS[tag]
+        elif tag == COLOR_CLOSE_TAG:
+            active_color = None
+
+    parts: list[str] = []
+
+    # Open color span if we're entering this chunk already colored
+    if active_color:
+        parts.append(
+            f'<span style="background:{active_color}22;color:{active_color};">'
+        )
+
+    # Render the text tokens (may contain further inline tags)
+    for token in _TAG_RE.split(text):
+        if not token:
+            continue
+        if _TAG_RE.match(token):
+            if token in COLOR_TAGS:
+                if active_color:
+                    parts.append('</span>')
+                active_color = COLOR_TAGS[token]
+                parts.append(
+                    f'<span style="background:{active_color}22;color:{active_color};">'
+                )
+            elif token == COLOR_CLOSE_TAG:
+                if active_color:
+                    parts.append('</span>')
+                active_color = None
+            else:
+                badge = _tag_badge_html(token)
+                if badge:
+                    parts.append(badge)
         else:
-            result_tokens.append(token)
+            escaped = (token
+                       .replace('&', '&amp;')
+                       .replace('<', '&lt;')
+                       .replace('>', '&gt;')
+                       .replace('\n', '<br>'))
+            parts.append(escaped)
 
-    return "".join(result_tokens)
+    if active_color:
+        parts.append('</span>')
+
+    return "".join(parts)
+
+
+# ─────────────────────────────────────────────
+#  Tag syntax highlighter for translation boxes
+# ─────────────────────────────────────────────
+
+class TagHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super().__init__(document)
+
+        self._tag_format = QTextCharFormat()
+        self._tag_format.setForeground(QColor('#888888'))
+        self._tag_format.setFontItalic(True)
+
+        self._color_formats: dict[str, QTextCharFormat] = {}
+        for tag, css_color in COLOR_TAGS.items():
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(css_color))
+            fmt.setFontWeight(700)
+            self._color_formats[tag] = fmt
+
+        self._close_format = QTextCharFormat()
+        self._close_format.setForeground(QColor('#888888'))
+        self._close_format.setFontWeight(700)
+
+        self._tag_re = re.compile(r'<[^>]+>')
+
+    def highlightBlock(self, text: str):
+        active_color_fmt: QTextCharFormat | None = None
+        i = 0
+        while i < len(text):
+            m = self._tag_re.search(text, i)
+            if active_color_fmt and (m is None or m.start() > i):
+                end = m.start() if m else len(text)
+                self.setFormat(i, end - i, active_color_fmt)
+            if m is None:
+                break
+            tag = m.group(0)
+            start, end = m.start(), m.end()
+            if tag in COLOR_TAGS:
+                self.setFormat(start, end - start, self._color_formats[tag])
+                txt_fmt = QTextCharFormat()
+                txt_fmt.setForeground(QColor(COLOR_TAGS[tag]))
+                active_color_fmt = txt_fmt
+            elif tag == COLOR_CLOSE_TAG:
+                self.setFormat(start, end - start, self._close_format)
+                active_color_fmt = None
+            else:
+                self.setFormat(start, end - start, self._tag_format)
+            i = end
 
 
 # ─────────────────────────────────────────────
@@ -204,11 +323,11 @@ ORIG_STYLE = (
     "background: #1e1e1e; color: #cccccc; border: 1px solid #444; "
     "font-family: 'Consolas', monospace; font-size: 12px;"
 )
-TRANS_STYLE_OK    = (
+TRANS_STYLE_OK = (
     "background: #1a2a1a; color: #e0e0e0; border: 1px solid #558855; "
     "font-family: 'Consolas', monospace; font-size: 12px;"
 )
-TRANS_STYLE_WARN  = (
+TRANS_STYLE_WARN = (
     "background: #2a2a1a; color: #e0e0e0; border: 2px solid #ffaa00; "
     "font-family: 'Consolas', monospace; font-size: 12px;"
 )
@@ -219,21 +338,151 @@ TRANS_STYLE_ERROR = (
 
 
 # ─────────────────────────────────────────────
+#  DialoguePreview — two-line in-game textbox
+# ─────────────────────────────────────────────
+
+PREVIEW_FONT_FAMILY = "Consolas"
+PREVIEW_FONT_SIZE   = 13        # pt — tweak once real font is known
+PREVIEW_MAX_CHARS   = 55        # chars per line — swap for px when font available
+PREVIEW_LINES       = 2
+PREVIEW_BG          = QColor("#0a0a1a")
+PREVIEW_BORDER      = QColor("#6655aa")
+PREVIEW_TEXT        = QColor("#f0f0e0")
+PREVIEW_OVERFLOW    = QColor("#ff4444")
+PREVIEW_PADDING_X   = 10
+PREVIEW_PADDING_Y   = 6
+
+
+class DialoguePreview(QWidget):
+    """
+    Mimics the TGAA two-line dialogue textbox.
+    Pass plain translated text (no tags); it wraps automatically at
+    PREVIEW_MAX_CHARS and renders in a styled box. Lines beyond 2 are
+    shown in red to signal overflow.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = ""
+        self._font = QFont(PREVIEW_FONT_FAMILY, PREVIEW_FONT_SIZE)
+        self._font.setStyleHint(QFont.Monospace)
+        from PyQt5.QtGui import QFontMetrics
+        fm = QFontMetrics(self._font)
+        line_h = fm.height()
+        total_h = line_h * PREVIEW_LINES + PREVIEW_PADDING_Y * 2 + 6
+        self.setFixedHeight(total_h)
+        self.setMinimumWidth(200)
+
+    def set_text(self, text: str):
+        # Strip any tags the translator may have typed
+        clean = re.sub(r'<[^>]+>', '', text).strip()
+        self._text = clean
+        self.update()
+
+    def _wrap(self, text: str) -> list[str]:
+        """Word-wrap text into lines of at most PREVIEW_MAX_CHARS chars."""
+        if not text:
+            return []
+        # Respect explicit newlines first, then wrap each segment
+        lines: list[str] = []
+        for paragraph in text.splitlines():
+            if not paragraph:
+                lines.append("")
+                continue
+            words = paragraph.split(' ')
+            current = ""
+            for word in words:
+                # A single word longer than max: hard-break it
+                while len(word) > PREVIEW_MAX_CHARS:
+                    space_left = PREVIEW_MAX_CHARS - len(current)
+                    current += word[:space_left]
+                    lines.append(current)
+                    word = word[space_left:]
+                    current = ""
+                candidate = (current + " " + word).strip()
+                if len(candidate) <= PREVIEW_MAX_CHARS:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+        return lines
+
+    def paintEvent(self, event):
+        from PyQt5.QtGui import QPainter, QFontMetrics
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w, h = self.width(), self.height()
+
+        # Background
+        painter.fillRect(0, 0, w, h, PREVIEW_BG)
+
+        # Border
+        painter.setPen(PREVIEW_BORDER)
+        painter.drawRect(0, 0, w - 1, h - 1)
+        # Inner border double-line effect
+        painter.setPen(PREVIEW_BORDER.darker(150))
+        painter.drawRect(2, 2, w - 5, h - 5)
+
+        painter.setFont(self._font)
+        fm = QFontMetrics(self._font)
+        line_h = fm.height()
+
+        lines = self._wrap(self._text)
+
+        for i in range(max(len(lines), PREVIEW_LINES)):
+            y = PREVIEW_PADDING_Y + i * line_h + fm.ascent()
+            if i >= len(lines):
+                break
+            line_text = lines[i]
+            if i < PREVIEW_LINES:
+                painter.setPen(PREVIEW_TEXT)
+            else:
+                # Overflow line — draw red background strip then red text
+                painter.fillRect(
+                    PREVIEW_PADDING_X, PREVIEW_PADDING_Y + i * line_h,
+                    w - PREVIEW_PADDING_X * 2, line_h,
+                    QColor("#330000")
+                )
+                painter.setPen(PREVIEW_OVERFLOW)
+            painter.drawText(PREVIEW_PADDING_X, y, line_text)
+
+        # Overflow indicator label
+        if len(lines) > PREVIEW_LINES:
+            overflow_count = len(lines) - PREVIEW_LINES
+            painter.setPen(PREVIEW_OVERFLOW)
+            small = QFont(PREVIEW_FONT_FAMILY, 8)
+            painter.setFont(small)
+            painter.drawText(
+                w - 90, h - 3,
+                f"⛔ +{overflow_count} строк(и) лишних"
+            )
+
+        painter.end()
+
+
+# ─────────────────────────────────────────────
 #  ChunkPair — one original / translation pair
 # ─────────────────────────────────────────────
 
 class ChunkPair(QWidget):
     changed = pyqtSignal()
 
-    def __init__(self, original_text: str, pause_tag: str, parent=None):
+    def __init__(self, prefix_tags: str, plain_text: str, pause_tag: str, parent=None):
         super().__init__(parent)
         self.pause_tag = pause_tag
 
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 2, 0, 2)
-        row.setSpacing(6)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 2, 0, 4)
+        outer.setSpacing(3)
 
-        # Left: original
+        # ── Top row: original (left) | translation (right) ──
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+
+        # Left: original (rich HTML)
         left = QVBoxLayout()
         left.setSpacing(1)
         badge_text = pause_tag if pause_tag else "↵ конец"
@@ -243,14 +492,18 @@ class ChunkPair(QWidget):
         )
         left.addWidget(badge)
         self.orig_edit = QTextEdit()
-        self.orig_edit.setPlainText(original_text)
         self.orig_edit.setReadOnly(True)
         self.orig_edit.setFixedHeight(65)
         self.orig_edit.setStyleSheet(ORIG_STYLE)
+        html_body = segment_to_rich_html(prefix_tags, plain_text)
+        self.orig_edit.setHtml(
+            f'<div style="font-family:Consolas,monospace;font-size:12px;'
+            f'color:#cccccc;background:#1e1e1e;">{html_body}</div>'
+        )
         left.addWidget(self.orig_edit)
-        row.addLayout(left)
+        top_row.addLayout(left)
 
-        # Right: translation
+        # Right: translation with tag highlighter
         right = QVBoxLayout()
         right.setSpacing(1)
         top_right = QHBoxLayout()
@@ -263,11 +516,20 @@ class ChunkPair(QWidget):
         self.trans_edit.setFixedHeight(65)
         self.trans_edit.setStyleSheet(TRANS_STYLE_OK)
         self.trans_edit.textChanged.connect(self._on_changed)
+        self._highlighter = TagHighlighter(self.trans_edit.document())
         right.addWidget(self.trans_edit)
-        row.addLayout(right)
+        top_row.addLayout(right)
+
+        outer.addLayout(top_row)
+
+        
+        
 
     def _on_changed(self):
         text = self.trans_edit.toPlainText()
+        # Update preview (strip tags before passing)
+        
+
         level, max_len = line_length_warning(text)
         if level == 'error':
             self.len_lbl.setText(f"⛔ {max_len}/{MAX_LINE_LEN}")
@@ -288,6 +550,7 @@ class ChunkPair(QWidget):
 
     def set_translation(self, text: str):
         self.trans_edit.setPlainText(text)
+        
 
 
 # ─────────────────────────────────────────────
@@ -345,10 +608,27 @@ class SegmentRow(QFrame):
             chunks = [{"prefix_tags": "", "text": clean_text(segment), "pause_tag": ""}]
 
         for chunk in chunks:
-            pair = ChunkPair(chunk["text"], chunk["pause_tag"])
+            pair = ChunkPair(
+                prefix_tags=chunk["prefix_tags"],
+                plain_text=chunk["text"],
+                pause_tag=chunk["pause_tag"],
+            )
             pair.changed.connect(self._on_any_chunk_changed)
             self.chunk_pairs.append(pair)
             outer.addWidget(pair)
+
+        # ── Page-level preview (all chunks combined) ──
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #444455;")
+        outer.addWidget(sep)
+
+        page_lbl = QLabel("📄 Страница целиком:")
+        page_lbl.setStyleSheet("color: #8888aa; font-size: 10px; font-style: italic;")
+        outer.addWidget(page_lbl)
+
+        self.page_preview = DialoguePreview()
+        outer.addWidget(self.page_preview)
 
     def _apply_status_style(self):
         color = STATUS_COLORS.get(self.status, "#3c3c3c")
@@ -367,6 +647,15 @@ class SegmentRow(QFrame):
             self._set_status(STATUS_TRANSLATED)
         elif not has_any:
             self._set_status(STATUS_UNTRANSLATED)
+        self._update_page_preview()
+
+    def _update_page_preview(self):
+        combined = " ".join(
+            re.sub(r'<[^>]+>', '', p.get_translation()).strip()
+            for p in self.chunk_pairs
+            if p.get_translation().strip()
+        )
+        self.page_preview.set_text(combined)
 
     def _set_status(self, status: str):
         self.status = status
@@ -392,6 +681,7 @@ class SegmentRow(QFrame):
         for i, pair in enumerate(self.chunk_pairs):
             if i < len(translations):
                 pair.set_translation(translations[i])
+        self._update_page_preview()
 
     def get_injected_segment(self) -> str:
         translations = self.get_translations()
@@ -495,7 +785,6 @@ class Tab1(QWidget):
         raw = self.tab2.raw_script
         all_segments = raw.split('<PAGE>')
 
-        # Map segment index → SegmentRow
         row_by_seg_index: dict[int, SegmentRow] = {}
         row_iter = iter(rows)
         for seg_idx, seg in enumerate(all_segments):
@@ -686,7 +975,7 @@ class Tab2(QWidget):
             translations = row.get_translations()
             chunks = parse_chunks(row.raw_segment)
             if not chunks:
-                chunks = [{"text": clean_text(row.raw_segment), "pause_tag": "", "prefix_tags": ""}]
+                chunks = [{"prefix_tags": "", "text": clean_text(row.raw_segment), "pause_tag": ""}]
 
             if char and char != last_character:
                 if lines:
