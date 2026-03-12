@@ -43,6 +43,16 @@ CHARACTER_TAGS = {
     r'<E041 6 7>':    "ван Зикс",
     r'<E041 97 60>':  "Нэш (высокий)",
     r'<E041 94 58>':  "Грейдон",
+    r'<E041 8 4>':  "Рютаро",
+    r'<E041 24 15>':  "Судья",
+    r'<E041 25 16>':  "Аучи",
+    r'<E041 13 11>':  "Микотоба",
+    r'<E041 41 65>':  "Рей",
+    r'<E041 28 64>':  "Менимемо",
+    r'<E041 27 19>':  "Хосонага",
+    r'<E041 29 32>':  "Сосэки",
+    r'<E041 30 15>':  "Сеиширо",
+    r'<E041 8 2>':  "Сусато",
 }
 
 STATUS_UNTRANSLATED = "untranslated"
@@ -197,8 +207,8 @@ def inject_translations(segment: str, translations: list[str]) -> str:
 
     replacement: dict[int, str] = {}
     for ti, tok_idx in enumerate(text_indices):
-        trans = translations[ti].strip() if ti < len(translations) else ""
-        if trans:
+        trans = translations[ti] if ti < len(translations) else ""
+        if trans.strip():
             replacement[tok_idx] = trans
 
     return "".join(replacement.get(i, t) for i, t in enumerate(tokens))
@@ -666,10 +676,9 @@ class SegmentRow(QFrame):
         self._update_page_preview()
 
     def _update_page_preview(self):
-        combined = " ".join(
-            re.sub(r'<[^>]+>', '', p.get_translation()).strip()
+        combined = "".join(
+            re.sub(r'<[^>]+>', '', p.get_translation())
             for p in self.chunk_pairs
-            if p.get_translation().strip()
         )
         self.page_preview.set_text(combined)
 
