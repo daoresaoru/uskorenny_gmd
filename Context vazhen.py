@@ -63,7 +63,8 @@ STATUS_LABELS = {
     STATUS_APPROVED:     "🟪 Одобрено",
 }
 
-MAX_LINE_LEN = 55
+MAX_LINE_PX   = 612   # pixels — Times New Roman 16pt, fits sample line
+MAX_LINE_WARN = 320   # ~10px before limit
 
 _TAG_RE  = re.compile(r'(<[^>]+>)')
 _E003_RE = re.compile(r'^<E003')
@@ -112,16 +113,26 @@ def clean_text(segment: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
+# Shared font metrics for line-length measurement (Times New Roman 16pt)
+_MEASURE_FONT = QFont("Times New Roman", 16)
+
+def _line_px(text: str) -> int:
+    """Return pixel width of a single line of text in the game font."""
+    from PyQt5.QtGui import QFontMetrics
+    return QFontMetrics(_MEASURE_FONT).horizontalAdvance(text)
+
 def line_length_warning(text: str) -> tuple[str, int]:
     if not text.strip():
         return '', 0
-    lines = text.splitlines()
-    max_len = max(len(l) for l in lines) if lines else 0
-    if max_len > MAX_LINE_LEN:
-        return 'error', max_len
-    elif max_len > MAX_LINE_LEN - 5:
-        return 'warn', max_len
-    return 'ok', max_len
+    # Strip any tags the translator typed before measuring
+    import re as _re
+    clean = _re.sub(r'<[^>]+>', '', text)
+    max_px = max((_line_px(l) for l in clean.splitlines()), default=0)
+    if max_px > MAX_LINE_PX:
+        return 'error', max_px
+    elif max_px > MAX_LINE_WARN:
+        return 'warn', max_px
+    return 'ok', max_px
 
 
 # ─────────────────────────────────────────────
@@ -341,9 +352,9 @@ TRANS_STYLE_ERROR = (
 #  DialoguePreview — two-line in-game textbox
 # ─────────────────────────────────────────────
 
-PREVIEW_FONT_FAMILY = "Consolas"
-PREVIEW_FONT_SIZE   = 13        # pt — tweak once real font is known
-PREVIEW_MAX_CHARS   = 55        # chars per line — swap for px when font available
+PREVIEW_FONT_FAMILY = "Times New Roman"
+PREVIEW_FONT_SIZE   = 16
+PREVIEW_MAX_PX      = MAX_LINE_PX
 PREVIEW_LINES       = 2
 PREVIEW_BG          = QColor("#0a0a1a")
 PREVIEW_BORDER      = QColor("#6655aa")
@@ -380,10 +391,15 @@ class DialoguePreview(QWidget):
         self.update()
 
     def _wrap(self, text: str) -> list[str]:
-        """Word-wrap text into lines of at most PREVIEW_MAX_CHARS chars."""
+        """Word-wrap text into lines fitting within PREVIEW_MAX_PX pixels."""
+        from PyQt5.QtGui import QFontMetrics
+        fm = QFontMetrics(self._font)
+
+        def px(s: str) -> int:
+            return fm.horizontalAdvance(s)
+
         if not text:
             return []
-        # Respect explicit newlines first, then wrap each segment
         lines: list[str] = []
         for paragraph in text.splitlines():
             if not paragraph:
@@ -392,15 +408,16 @@ class DialoguePreview(QWidget):
             words = paragraph.split(' ')
             current = ""
             for word in words:
-                # A single word longer than max: hard-break it
-                while len(word) > PREVIEW_MAX_CHARS:
-                    space_left = PREVIEW_MAX_CHARS - len(current)
-                    current += word[:space_left]
-                    lines.append(current)
-                    word = word[space_left:]
-                    current = ""
+                # Hard-break a single word that is wider than the box
+                while px(word) > PREVIEW_MAX_PX:
+                    for cut in range(len(word), 0, -1):
+                        if px((current + word[:cut]).strip()) <= PREVIEW_MAX_PX:
+                            lines.append((current + word[:cut]).strip())
+                            word = word[cut:]
+                            current = ""
+                            break
                 candidate = (current + " " + word).strip()
-                if len(candidate) <= PREVIEW_MAX_CHARS:
+                if px(candidate) <= PREVIEW_MAX_PX:
                     current = candidate
                 else:
                     lines.append(current)
@@ -523,24 +540,23 @@ class ChunkPair(QWidget):
         outer.addLayout(top_row)
 
         
-        
 
     def _on_changed(self):
         text = self.trans_edit.toPlainText()
         # Update preview (strip tags before passing)
-        
+       
 
         level, max_len = line_length_warning(text)
         if level == 'error':
-            self.len_lbl.setText(f"⛔ {max_len}/{MAX_LINE_LEN}")
+            self.len_lbl.setText(f"⛔ {max_len}/{MAX_LINE_PX}px")
             self.len_lbl.setStyleSheet("color: #ff5555; font-size: 10px; font-weight: bold;")
             self.trans_edit.setStyleSheet(TRANS_STYLE_ERROR)
         elif level == 'warn':
-            self.len_lbl.setText(f"⚠️ {max_len}/{MAX_LINE_LEN}")
+            self.len_lbl.setText(f"⚠️ {max_len}/{MAX_LINE_PX}px")
             self.len_lbl.setStyleSheet("color: #ffaa00; font-size: 10px;")
             self.trans_edit.setStyleSheet(TRANS_STYLE_WARN)
         else:
-            self.len_lbl.setText(f"✓ {max_len}/{MAX_LINE_LEN}" if max_len else "")
+            self.len_lbl.setText(f"✓ {max_len}/{MAX_LINE_PX}px" if max_len else "")
             self.len_lbl.setStyleSheet("color: #55aa55; font-size: 10px;")
             self.trans_edit.setStyleSheet(TRANS_STYLE_OK)
         self.changed.emit()
